@@ -1,0 +1,117 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "17 9 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: sync-upstream-mirror
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  sync:
+    if: github.repository == 'Hunter0xone/t3code' && github.ref_type == 'branch' && github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      pull-requests: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Fetch upstream main
+        run: |
+          git init --quiet
+          git remote add upstream https://github.com/pingdotgg/t3code.git
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags --filter=blob:none upstream refs/heads/main:refs/remotes/upstream/main
+
+      - name: Fast-forward upstream-mirror
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_MIRROR_TOKEN: ${{ secrets.UPSTREAM_MIRROR_TOKEN }}
+        run: |
+          auth_git() {
+            git -c credential.helper= -c 'credential.helper=!gh auth git-credential' "$@"
+          }
+
+          upstream_sha=$(git rev-parse refs/remotes/upstream/main)
+          mirror_ref=$(auth_git ls-remote --refs origin refs/heads/upstream-mirror)
+          if [[ -n "$mirror_ref" ]]; then
+            auth_git fetch --no-tags --filter=blob:none origin \
+              refs/heads/upstream-mirror:refs/remotes/origin/upstream-mirror
+            mirror_sha=$(git rev-parse refs/remotes/origin/upstream-mirror)
+            if ! git merge-base --is-ancestor "$mirror_sha" "$upstream_sha"; then
+              echo "::error::upstream-mirror (${mirror_sha}) cannot fast-forward to upstream/main (${upstream_sha})."
+              exit 1
+            fi
+          fi
+
+          if [[ "${mirror_sha:-}" != "$upstream_sha" ]]; then
+            refspec="${upstream_sha}:refs/heads/upstream-mirror"
+            if push_log=$(auth_git push origin "$refspec" 2>&1); then
+              printf '%s\n' "$push_log"
+            elif [[ "$push_log" == *".github/workflows/"*"permission"* ]]; then
+              if [[ -z "$UPSTREAM_MIRROR_TOKEN" ]]; then
+                printf '%s\n' "$push_log" >&2
+                echo "::error::Configure UPSTREAM_MIRROR_TOKEN as a repository Actions secret with Contents and Workflows write access to this fork."
+                exit 1
+              fi
+              GH_TOKEN="$UPSTREAM_MIRROR_TOKEN" auth_git push origin "$refspec"
+            else
+              printf '%s\n' "$push_log" >&2
+              exit 1
+            fi
+          fi
+          printf 'upstream-mirror: `%s`\n' "$upstream_sha" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open or reuse the upstream review PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git -c credential.helper= -c 'credential.helper=!gh auth git-credential' \
+            fetch --no-tags --filter=blob:none origin refs/heads/custom:refs/remotes/origin/custom
+          custom=refs/remotes/origin/custom
+          upstream=refs/remotes/upstream/main
+          counts=$(git rev-list --left-right --count "$custom...$upstream")
+          read -r custom_only upstream_only <<< "$counts"
+
+          if (( upstream_only == 0 )); then
+            echo 'custom already contains upstream/main.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if (( custom_only > 0 )); then
+            echo "::notice::Branches have diverged. custom has ${custom_only} exclusive commit(s) and upstream/main has ${upstream_only}."
+            if ! git merge-base "$custom" "$upstream" >/dev/null; then
+              echo "::error::custom and upstream/main have no common ancestor."
+              exit 1
+            fi
+            if git -c credential.helper= -c 'credential.helper=!gh auth git-credential' \
+              merge-tree --write-tree "$custom" "$upstream" >/dev/null; then
+              echo 'The branches have diverged. The merge simulation found no conflicts.' >> "$GITHUB_STEP_SUMMARY"
+            else
+              status=$?
+              if (( status != 1 )); then
+                exit "$status"
+              fi
+              echo '::warning::Merging upstream-mirror into custom requires manual conflict resolution.'
+              echo 'The merge simulation found conflicts. Resolve them during PR review.' >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+
+          pulls="repos/${GITHUB_REPOSITORY}/pulls"
+          pr_url=$(gh api --method GET "$pulls" --paginate \
+            -f state=open -f base=custom -f head="${GITHUB_REPOSITORY_OWNER}:upstream-mirror" \
+            --jq '.[] | select(.head.repo.full_name == .base.repo.full_name) | .html_url')
+          if [[ -z "$pr_url" ]]; then
+            pr_url=$(gh api --method POST "$pulls" -f base=custom -f head=upstream-mirror \
+              -f title='Sync upstream/main into custom' \
+              -f body='Review the upstream changes before merging. Use a merge commit to keep upstream history in custom.' \
+              --jq '.html_url')
+          fi
+          printf 'Review PR: %s\n' "$pr_url" >> "$GITHUB_STEP_SUMMARY"
